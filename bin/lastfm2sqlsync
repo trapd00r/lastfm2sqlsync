@@ -1,0 +1,127 @@
+#!/usr/bin/perl
+# run in a crontab every 25 mins or so to autosync lastfm scrobbles to local db
+# */25 * * * * lastfm2sqlsync >/dev/null 2>&1
+# the api call will always return the latest 50 scrobbles
+
+use strict;
+use warnings FATAL => 'all';
+our $VERSION = '0.01';
+
+use DBI;
+use DDP;
+use JSON;
+use LWP::UserAgent;
+use open qw(:std :utf8);
+
+# -- music.scrobbles definition
+#
+# CREATE TABLE `scrobbles` (
+#   `artist` varchar(512) DEFAULT NULL,
+#   `album` varchar(512) DEFAULT NULL,
+#   `title` varchar(512) DEFAULT NULL,
+#   `scrobbled_on` datetime DEFAULT NULL,
+#   `scrobbleid` int(11) NOT NULL AUTO_INCREMENT,
+#   `source` varchar(50) DEFAULT NULL,
+#   `epoch` int(11) DEFAULT NULL,
+#   PRIMARY KEY (`scrobbleid`)
+# ) ENGINE=InnoDB AUTO_INCREMENT=616582 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+
+my $last_fm_api_key = $ENV{LASTFM_API_KEY};
+my $username = $ENV{LASTFM_USER};
+
+my $url = "http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=$username&api_key=$last_fm_api_key&format=json";
+
+my $database = $ENV{SCROBBLE_DB_DATABASE};
+my $hostname = $ENV{SCROBBLE_DB_HOST};
+my $port     = $ENV{SCROBBLE_DB_PORT};
+
+my $user     = $ENV{SCROBBLE_DB_USER};
+my $password = $ENV{SCROBBLE_DB_PASSWORD};
+
+my $dsn = "DBI:mysql:database=$database;host=$hostname;port=$port";
+
+my $ua = LWP::UserAgent->new;
+my $response = $ua->get($url);
+
+if ($response->is_success) {
+  my $scrobbles = decode_json($response->decoded_content)->{'recenttracks'}->{'track'};
+  my $dbh = DBI->connect($dsn, $user, $password, { RaiseError => 1, AutoCommit => 1 });
+
+  foreach my $scrobble (@$scrobbles) {
+    my $metadata;
+    $metadata->{artist} = $scrobble->{artist}->{'#text'};
+    $metadata->{album}  = $scrobble->{album}->{'#text'};
+    $metadata->{title}  = $scrobble->{name};
+    $metadata->{epoch}  = $scrobble->{date}->{uts};
+    $metadata->{source} = 'lastfm2sqlsync';
+    $metadata->{scrobbled_on} = ymd($scrobble->{date}->{uts});
+
+    my $sth = $dbh->prepare("SELECT * FROM scrobbles WHERE artist = ? AND album = ? AND title = ? AND epoch = ?");
+
+    my $exists = $sth->execute($metadata->{artist}, $metadata->{album}, $metadata->{title}, $metadata->{epoch});
+
+    if($exists == 1) {
+      print "Skipping duplicate scrobble: $metadata->{artist} - $metadata->{album} - $metadata->{title} - $metadata->{epoch}\n";
+      next;
+    }
+    else {
+      # insert the scrobble
+      my $sth = $dbh->prepare("INSERT INTO scrobbles (artist, album, title, scrobbled_on, source, epoch) VALUES (?, ?, ?, ?, ?, ?)");
+      $sth->execute($metadata->{artist}, $metadata->{album}, $metadata->{title}, $metadata->{scrobbled_on}, $metadata->{source}, $metadata->{epoch});
+      print "Inserted scrobble: $metadata->{artist} - $metadata->{album} - $metadata->{title} - $metadata->{epoch}\n";
+    }
+  }
+  $dbh->disconnect;
+} else {
+  warn "Error fetching scrobbles: ", $response->status_line, "\n";
+}
+
+
+
+sub ymd {
+  my $time = shift;
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
+
+  # 2008-07-24 00:00:00.000
+  return sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year += 1900, $mon += 1, $mday, $hour, $min, $sec);
+}
+
+
+
+# {
+#     album        {
+#         #text   "Pieces of Me",
+#         mbid    "f1ec7bd9-94dc-48cb-9acb-094e2cbe0b17"
+#     },
+#     artist       {
+#         #text   "Lori McKenna",
+#         mbid    "886557b3-2fa6-494e-993d-b955e789dc57" (dualvar: 886557)
+#     },
+#     date         {
+#         #text   "22 Nov 2023, 10:28" (dualvar: 22),
+#         uts     1700648890
+#     },
+#     image        [
+#         [0] {
+#                 #text   "https://lastfm.freetls.fastly.net/i/u/34s/d6487c88f8f440ad97f8f2afd220a6e8.png",
+#                 size    "small"
+#             },
+#         [1] {
+#                 #text   "https://lastfm.freetls.fastly.net/i/u/64s/d6487c88f8f440ad97f8f2afd220a6e8.png",
+#                 size    "medium"
+#             },
+#         [2] {
+#                 #text   "https://lastfm.freetls.fastly.net/i/u/174s/d6487c88f8f440ad97f8f2afd220a6e8.png",
+#                 size    "large"
+#             },
+#         [3] {
+#                 #text   "https://lastfm.freetls.fastly.net/i/u/300x300/d6487c88f8f440ad97f8f2afd220a6e8.png",
+#                 size    "extralarge"
+#             }
+#     ],
+#     mbid         "",
+#     name         "Fireflies",
+#     streamable   0,
+#     url          "https://www.last.fm/music/Lori+McKenna/_/Fireflies"
+# }
